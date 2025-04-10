@@ -78,7 +78,6 @@ function validateSAPStrength(sap) {
   return { valid: true };
 }
 
-
 // Enhanced SAP storage with additional hashing
 async function setUserSAP(userId, sap) {
   // First validate the SAP
@@ -369,6 +368,595 @@ async function transferFromBotWallet(solAmount, destinationAddress) {
     withdrawalId: signature,
   };
 }
+
+// ----------------- Enhanced Fee Management System -----------------
+let currentFee = 0.02; // Initial fee is set to 2%
+
+// Command to change fee percentage - REMOVED SAP REQUIREMENT FOR ADMINS
+bot.command('setfee', async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    if (!ADMINS.includes(userId)) {
+      await ctx.reply('❌ Only admins have permission to use this command.');
+      return;
+    }
+
+    const message = ctx.message.text.replace('/setfee', '').trim();
+    const newFee = parseFloat(message);
+
+    if (isNaN(newFee) || newFee <= 0 || newFee > 1) {
+      await ctx.reply('❌ Invalid fee percentage. Please provide a value between 0 and 1 (e.g., 0.02 for 2%).');
+      return;
+    }
+
+    // Save the new fee to database for persistence
+    const feeRef = db.collection('system').doc('fee_settings');
+    await feeRef.set({
+      currentFee: newFee,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedBy: userId
+    }, { merge: true });
+
+    currentFee = newFee; // Update the in-memory fee value
+    await ctx.reply(`✅ Fee has been updated to ${(currentFee * 100).toFixed(2)}%`);
+    
+    // Log the fee change
+    await db.collection('fee_logs').add({
+      previousFee: currentFee,
+      newFee: newFee,
+      changedBy: userId,
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      reason: ctx.message.text.split(' ').slice(2).join(' ') || 'No reason provided'
+    });
+    
+  } catch (error) {
+    console.error('❌ Set Fee Error:', error);
+    await ctx.reply('❌ An error occurred while updating the fee. Please check logs.');
+  }
+});
+
+// Command to view current fee
+bot.command('fee', async (ctx) => {
+  try {
+    const feeMessage = `ℹ️ <b>Current Fee Structure</b>\n\n` +
+      `• Standard Fee: ${(currentFee * 100).toFixed(2)}%\n` +
+      `• VIP Users: ${(currentFee * 0.5 * 100).toFixed(2)}%\n` +
+      `• Referral Bonus: 25% of fees (first month)\n\n` +
+      `Fees are automatically deducted from transactions.`;
+    
+    await ctx.reply(feeMessage, { parse_mode: 'HTML' });
+  } catch (error) {
+    console.error('❌ Fee Command Error:', error);
+    await ctx.reply('❌ An error occurred while fetching fee information.');
+  }
+});
+
+// Command to view fee details and statistics
+// Command to view fee details and statistics
+bot.command('fees', async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    const isAdmin = ADMINS.includes(userId);
+
+    const message = ctx.message.text.replace('/fees', '').trim();
+    let startDate = null;
+    let endDate = null;
+
+    // Parse date range if provided
+    if (message) {
+      const dates = message.split(' ');
+      if (dates.length === 2) {
+        startDate = new Date(dates[0]);
+        endDate = new Date(dates[1]);
+
+        if (isNaN(startDate) || isNaN(endDate)) {
+          await ctx.reply('❌ Invalid date format. Use format: /fees <start_date> <end_date> (e.g., /fees 2023-06-01 2023-06-20)');
+          return;
+        }
+
+        // Add time to end date to include full day
+        endDate.setHours(23, 59, 59, 999);
+      }
+    }
+
+    // Get transactions and calculate fees for the given date range
+    let query = db.collection('transactions');
+
+    if (startDate) {
+      query = query.where('timestamp', '>=', startDate);
+    }
+    if (endDate) {
+      query = query.where('timestamp', '<=', endDate);
+    }
+
+    if (!isAdmin) {
+      query = query.where('userId', '==', userId.toString());
+    }
+
+    const transactionsSnapshot = await query.get();
+
+    let totalFeesSol = 0;
+    let totalFeesUSD = 0;
+    let totalTransactions = 0;
+    let totalAmount = 0;
+    const feeStats = {};
+    const userStats = {};
+
+    transactionsSnapshot.forEach(doc => {
+      const transaction = doc.data();
+      const type = transaction.type || 'unknown';
+      const userId = transaction.userId;
+      const transactionAmount = transaction.amountSOL || 0;
+      const amountUSD = transaction.amountUSD || 0;
+
+      totalTransactions++;
+
+      if (type === 'cash_buy' && amountUSD > 0) {
+        const feeUSD = amountUSD * currentFee;
+        totalFeesUSD += feeUSD;
+        totalAmount += amountUSD;
+        feeStats[type] = (feeStats[type] || 0) + feeUSD;
+
+        if (isAdmin) {
+          userStats[userId] = (userStats[userId] || 0) + feeUSD;
+        }
+      } else {
+        const feeSOL = transactionAmount * currentFee;
+        totalFeesSol += feeSOL;
+        totalAmount += transactionAmount;
+        feeStats[type] = (feeStats[type] || 0) + feeSOL;
+
+        if (isAdmin) {
+          userStats[userId] = (userStats[userId] || 0) + feeSOL;
+        }
+      }
+    });
+
+    // Format fee stats by type
+    let feeStatsText = '';
+    for (const [type, amount] of Object.entries(feeStats)) {
+      const isUSD = type === 'cash_buy';
+      feeStatsText += `• ${type}: ${isUSD ? `$${amount.toFixed(2)}` : `${amount.toFixed(4)} SOL`}\n`;
+    }
+
+    // Prepare response message
+    let response = `💸 <b>Fee Statistics</b>\n\n`;
+    response += `📅 Period: ${startDate ? startDate.toLocaleDateString() : 'All time'} to ${endDate ? endDate.toLocaleDateString() : 'Now'}\n`;
+    response += `📊 Total Transactions: ${totalTransactions}\n`;
+    response += `💰 Total Amount: ${totalAmount.toFixed(2)} (USD & SOL combined)\n`;
+    response += `💳 Total Fees Collected:\n   - 💵 USD: $${totalFeesUSD.toFixed(2)}\n   - 🪙 SOL: ${totalFeesSol.toFixed(4)} SOL\n`;
+    response += `📝 Current Fee Percentage: ${(currentFee * 100).toFixed(2)}%\n\n`;
+    response += `📌 <b>Fee Breakdown by Type</b>\n${feeStatsText}`;
+
+    // Add user breakdown for admins
+    if (isAdmin) {
+      response += `\n👥 <b>Top Users by Fees Paid</b>\n`;
+      const sortedUsers = Object.entries(userStats)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5);
+
+      for (const [userId, amount] of sortedUsers) {
+        response += `• User ${userId}: ${amount.toFixed(4)} ${amount > 1 ? 'USD/SOL' : ''}\n`;
+      }
+    }
+
+    await ctx.reply(response, { parse_mode: 'HTML' });
+
+  } catch (error) {
+    console.error('❌ Fees Command Error:', error);
+    await ctx.reply('❌ An error occurred while fetching fee statistics. Please check logs.');
+  }
+});
+
+
+// Command to view fee change history
+bot.command('feelog', async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    if (!ADMINS.includes(userId)) {
+      await ctx.reply('❌ Only admins have permission to view fee logs.');
+      return;
+    }
+
+    const message = ctx.message.text.replace('/feelog', '').trim();
+    let limit = 10;
+    
+    if (message && !isNaN(parseInt(message))) {
+      limit = parseInt(message);
+      if (limit > 50) limit = 50;
+    }
+
+    const logs = await db.collection('fee_logs')
+      .orderBy('timestamp', 'desc')
+      .limit(limit)
+      .get();
+    
+    let logText = '📝 <b>Recent Fee Changes</b>\n\n';
+    logs.forEach(doc => {
+      const log = doc.data();
+      logText += `🕒 ${log.timestamp.toDate().toLocaleString()}\n` +
+                 `🔄 ${(log.previousFee * 100).toFixed(2)}% → ${(log.newFee * 100).toFixed(2)}%\n` +
+                 `👤 Changed by: ${log.changedBy}\n` +
+                 `📝 Reason: ${log.reason || 'Not specified'}\n\n`;
+    });
+    
+    await ctx.reply(logText, { parse_mode: 'HTML' });
+  } catch (error) {
+    console.error('Fee log error:', error);
+    await ctx.reply('❌ Could not retrieve fee logs.');
+  }
+});
+
+// Command to set fee exemptions
+bot.command('setfeeexempt', async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    if (!ADMINS.includes(userId)) {
+      await ctx.reply('❌ Only admins have permission to set fee exemptions.');
+      return;
+    }
+
+    const args = ctx.message.text.split(' ').slice(1);
+    if (args.length < 2) {
+      await ctx.reply('❌ Usage: /setfeeexempt <user_id> <true/false>');
+      return;
+    }
+
+    const targetUserId = args[0];
+    const exemptStatus = args[1].toLowerCase() === 'true';
+
+    // Require SAP verification for admin actions
+    const sapVerified = await requireSAPVerification(ctx, 'set fee exemption');
+    if (!sapVerified) return;
+
+    const userRef = db.collection('users').doc(targetUserId);
+    await userRef.set({ feeExempt: exemptStatus }, { merge: true });
+
+    await ctx.reply(`✅ User ${targetUserId} fee exemption set to ${exemptStatus}`);
+    
+    // Log the exemption change
+    await db.collection('fee_logs').add({
+      type: 'exemption',
+      userId: targetUserId,
+      exemptStatus: exemptStatus,
+      changedBy: userId,
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      reason: args.slice(2).join(' ') || 'No reason provided'
+    });
+    
+  } catch (error) {
+    console.error('❌ Set Fee Exempt Error:', error);
+    await ctx.reply('❌ An error occurred while setting fee exemption.');
+  }
+});
+
+// Helper function to calculate fees with exemptions
+async function calculateFeeWithExemptions(userId, amount) {
+  try {
+    // Check for fee exemption
+    const userRef = db.collection('users').doc(userId.toString());
+    const userDoc = await userRef.get();
+    
+    if (userDoc.exists && userDoc.data().feeExempt) {
+      return { fee: 0, netAmount: amount, isExempt: true };
+    }
+    
+    // Check for VIP status (50% discount)
+    const isVIP = userDoc.exists && userDoc.data().vipStatus;
+    const effectiveFeeRate = isVIP ? currentFee * 0.5 : currentFee;
+    
+    const fee = amount * effectiveFeeRate;
+    return { 
+      fee, 
+      netAmount: amount - fee,
+      isExempt: false,
+      discount: isVIP ? 'VIP (50%)' : null
+    };
+  } catch (error) {
+    console.error('Fee calculation error:', error);
+    // Fallback to standard fee if error occurs
+    const fee = amount * currentFee;
+    return { fee, netAmount: amount - fee, isExempt: false };
+  }
+}
+
+// Updated transaction saving with fee details
+async function saveTransactionWithFees(userId, type, amountSOL, amountUSD, address, txId) {
+  try {
+    const feeDetails = await calculateFeeWithExemptions(userId, amountSOL);
+    
+    const txData = {
+      userId: userId.toString(),
+      type,
+      amountSOL,
+      amountUSD,
+      address,
+      transactionId: txId,
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      feeAmount: feeDetails.fee,
+      netAmount: feeDetails.netAmount,
+      feeRate: currentFee,
+      isFeeExempt: feeDetails.isExempt,
+      feeDiscount: feeDetails.discount || null
+    };
+
+    await db.collection('transactions').add(txData);
+    console.log('💾 Transaction with fee details saved.');
+    
+    // Update user's total fees paid if not exempt
+    if (!feeDetails.isExempt) {
+      const userRef = db.collection('users').doc(userId.toString());
+      await userRef.update({
+        totalFeesPaid: admin.firestore.FieldValue.increment(feeDetails.fee),
+        lastTransaction: admin.firestore.FieldValue.serverTimestamp()
+      });
+    }
+    
+    return txData;
+  } catch (error) {
+    console.error('❌ Transaction Save Error:', error);
+    throw error;
+  }
+}
+
+// Load current fee from database on startup
+async function loadCurrentFee() {
+  try {
+    const feeRef = db.collection('system').doc('fee_settings');
+    const doc = await feeRef.get();
+    
+    if (doc.exists && doc.data().currentFee) {
+      currentFee = doc.data().currentFee;
+      console.log(`Loaded current fee from DB: ${currentFee * 100}%`);
+      
+      // Check if we need to apply scheduled fee change
+      if (doc.data().scheduledFee && doc.data().scheduledChangeTime) {
+        const changeTime = doc.data().scheduledChangeTime.toDate();
+        if (new Date() >= changeTime) {
+          // Time to apply scheduled change
+          currentFee = doc.data().scheduledFee;
+          await feeRef.set({
+            currentFee: currentFee,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedBy: 'system',
+            previousFee: doc.data().currentFee,
+            scheduledFee: null,
+            scheduledChangeTime: null
+          }, { merge: true });
+          console.log(`Applied scheduled fee change to ${currentFee * 100}%`);
+        }
+      }
+    } else {
+      // Initialize with default if not exists
+      await feeRef.set({
+        currentFee: currentFee,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        feeStructure: {
+          standard: currentFee,
+          vip: currentFee * 0.5,
+          exempt: 0
+        }
+      });
+      console.log(`Initialized fee settings with default: ${currentFee * 100}%`);
+    }
+  } catch (error) {
+    console.error('Error loading fee settings:', error);
+  }
+}
+
+// Schedule a future fee change
+bot.command('schedulefee', async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    if (!ADMINS.includes(userId)) {
+      await ctx.reply('❌ Only admins can schedule fee changes.');
+      return;
+    }
+
+    const args = ctx.message.text.split(' ').slice(1);
+    if (args.length < 2) {
+      await ctx.reply('❌ Usage: /schedulefee <new_fee> <YYYY-MM-DD> [HH:MM] [reason]');
+      return;
+    }
+
+    const newFee = parseFloat(args[0]);
+    if (isNaN(newFee) || newFee <= 0 || newFee > 1) {
+      await ctx.reply('❌ Invalid fee percentage. Must be between 0 and 1.');
+      return;
+    }
+
+    const dateParts = args[1].split('-');
+    if (dateParts.length !== 3) {
+      await ctx.reply('❌ Invalid date format. Use YYYY-MM-DD.');
+      return;
+    }
+
+    let changeTime = new Date(args[1]);
+    if (args[2] && args[2].includes(':')) {
+      const timeParts = args[2].split(':');
+      changeTime.setHours(parseInt(timeParts[0]), parseInt(timeParts[1]), 0, 0);
+    } else {
+      changeTime.setHours(0, 0, 0, 0);
+      if (args[2] && !args[2].includes(':')) {
+        // The arg after date is not a time, so it's part of the reason
+        args.splice(2, 0, '00:00');
+      }
+    }
+
+    if (isNaN(changeTime.getTime())) {
+      await ctx.reply('❌ Invalid date/time provided.');
+      return;
+    }
+
+    if (changeTime <= new Date()) {
+      await ctx.reply('❌ Scheduled time must be in the future.');
+      return;
+    }
+
+    const reason = args.slice(3).join(' ') || 'No reason provided';
+
+    // Require SAP verification for admin actions
+    const sapVerified = await requireSAPVerification(ctx, 'schedule fee change');
+    if (!sapVerified) return;
+
+    const feeRef = db.collection('system').doc('fee_settings');
+    await feeRef.set({
+      scheduledFee: newFee,
+      scheduledChangeTime: changeTime,
+      scheduledBy: userId,
+      scheduledReason: reason
+    }, { merge: true });
+
+    await ctx.reply(
+      `✅ Fee change scheduled:\n` +
+      `🔄 New Fee: ${(newFee * 100).toFixed(2)}%\n` +
+      `⏰ Effective: ${changeTime.toLocaleString()}\n` +
+      `📝 Reason: ${reason}`
+    );
+
+    // Log the scheduled change
+    await db.collection('fee_logs').add({
+      type: 'scheduled',
+      newFee: newFee,
+      changeTime: changeTime,
+      scheduledBy: userId,
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      reason: reason
+    });
+    
+  } catch (error) {
+    console.error('❌ Schedule Fee Error:', error);
+    await ctx.reply('❌ An error occurred while scheduling fee change.');
+  }
+});
+
+// Check scheduled fee changes
+bot.command('checkschedule', async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    if (!ADMINS.includes(userId)) {
+      await ctx.reply('❌ Only admins can check scheduled fee changes.');
+      return;
+    }
+
+    const feeRef = db.collection('system').doc('fee_settings');
+    const doc = await feeRef.get();
+
+    if (!doc.exists || !doc.data().scheduledFee) {
+      await ctx.reply('ℹ️ No scheduled fee changes.');
+      return;
+    }
+
+    const data = doc.data();
+    const changeTime = data.scheduledChangeTime.toDate();
+    const timeUntil = moment(changeTime).fromNow();
+
+    await ctx.reply(
+      `⏰ <b>Scheduled Fee Change</b>\n\n` +
+      `🔄 New Fee: ${(data.scheduledFee * 100).toFixed(2)}%\n` +
+      `⏳ Effective: ${changeTime.toLocaleString()} (${timeUntil})\n` +
+      `👤 Scheduled by: ${data.scheduledBy}\n` +
+      `📝 Reason: ${data.scheduledReason || 'Not specified'}`,
+      { parse_mode: 'HTML' }
+    );
+    
+  } catch (error) {
+    console.error('❌ Check Schedule Error:', error);
+    await ctx.reply('❌ An error occurred while checking scheduled changes.');
+  }
+});
+
+// Cancel scheduled fee change
+bot.command('cancelschedule', async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    if (!ADMINS.includes(userId)) {
+      await ctx.reply('❌ Only admins can cancel scheduled fee changes.');
+      return;
+    }
+
+    const feeRef = db.collection('system').doc('fee_settings');
+    const doc = await feeRef.get();
+
+    if (!doc.exists || !doc.data().scheduledFee) {
+      await ctx.reply('ℹ️ No scheduled fee changes to cancel.');
+      return;
+    }
+
+    // Require SAP verification for admin actions
+    const sapVerified = await requireSAPVerification(ctx, 'cancel scheduled fee change');
+    if (!sapVerified) return;
+
+    await feeRef.update({
+      scheduledFee: null,
+      scheduledChangeTime: null,
+      scheduledBy: null,
+      scheduledReason: null
+    });
+
+    await ctx.reply('✅ Scheduled fee change has been cancelled.');
+    
+    // Log the cancellation
+    await db.collection('fee_logs').add({
+      type: 'schedule_cancelled',
+      cancelledBy: userId,
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      originalNewFee: doc.data().scheduledFee,
+      originalChangeTime: doc.data().scheduledChangeTime
+    });
+    
+  } catch (error) {
+    console.error('❌ Cancel Schedule Error:', error);
+    await ctx.reply('❌ An error occurred while cancelling scheduled change.');
+  }
+});
+
+// Call this function when bot starts
+loadCurrentFee();
+
+// Periodically check for scheduled fee changes
+setInterval(async () => {
+  try {
+    const feeRef = db.collection('system').doc('fee_settings');
+    const doc = await feeRef.get();
+    
+    if (doc.exists && doc.data().scheduledFee && doc.data().scheduledChangeTime) {
+      const changeTime = doc.data().scheduledChangeTime.toDate();
+      if (new Date() >= changeTime) {
+        // Time to apply scheduled change
+        const newFee = doc.data().scheduledFee;
+        currentFee = newFee;
+        await feeRef.set({
+          currentFee: currentFee,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedBy: 'system',
+          previousFee: doc.data().currentFee,
+          scheduledFee: null,
+          scheduledChangeTime: null
+        }, { merge: true });
+        
+        console.log(`Applied scheduled fee change to ${currentFee * 100}%`);
+        
+        // Notify admins
+        const admins = ADMINS;
+        for (const adminId of admins) {
+          try {
+            await bot.telegram.sendMessage(
+              adminId,
+              `⏰ <b>Scheduled Fee Change Applied</b>\n\n` +
+              `The fee has been automatically changed to ${(newFee * 100).toFixed(2)}% as scheduled.`,
+              { parse_mode: 'HTML' }
+            );
+          } catch (error) {
+            console.error(`Failed to notify admin ${adminId}:`, error);
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Error in fee schedule check:', error);
+  }
+}, 3600000); // Check every hour
 
 // ----------------- Referral Logic -----------------
 async function registerReferral(userId, referralCode) {
@@ -845,7 +1433,8 @@ async function processPayment(ctx, { phoneNumber, amount, solAddress, paymentMet
     const transactionId = preauthResponse.data.params.transactionId;
     ctx.session.cashBuy = { referenceId, transactionId };
 
-    const fee = amount * 0.05;
+    // Fixed 5% fee for cash buys (0.5 USD on $10 deposit)
+    const fee = amount * currentFee;
     const netAmountForConversion = amount - fee;
 
     let result;
@@ -878,7 +1467,13 @@ async function processPayment(ctx, { phoneNumber, amount, solAddress, paymentMet
         await updateReferralBonus(referrerCode, fee, result, userId);
       }
       await ctx.reply(
-        `🎉 <b>Congratulations!</b>\nYour purchase is complete.\n\nNet Amount: $${netAmountForConversion.toFixed(2)} USD was used to buy SOL.\nAcquired SOL: ${result.acquiredSol.toFixed(4)} SOL.\nTransaction ID: ${result.withdrawalId}\n🔍 <a href="https://solscan.io/tx/${result.withdrawalId}">View on Solscan</a>`,
+        `🎉 <b>Congratulations!</b>\nYour purchase is complete.\n\n` +
+        `Deposit Amount: $${amount.toFixed(2)} USD\n` +
+        `Fee (5%): $${fee.toFixed(2)} USD\n` +
+        `Net Amount: $${netAmountForConversion.toFixed(2)} USD\n` +
+        `Acquired SOL: ${result.acquiredSol.toFixed(4)} SOL\n` +
+        `Transaction ID: ${result.withdrawalId}\n` +
+        `🔍 <a href="https://solscan.io/tx/${result.withdrawalId}">View on Solscan</a>`,
         { parse_mode: 'HTML' }
       );
     } else {
@@ -1061,6 +1656,20 @@ bot.command('stats', async (ctx) => {
       await ctx.reply('⚠️ Could not retrieve bot wallet balance');
     }
 
+    // Get total fees collected
+    let totalFees = 0;
+    try {
+      const feesSnapshot = await db.collection('transactions')
+        .where('feeAmount', '>', 0)
+        .get();
+      
+      feesSnapshot.forEach(doc => {
+        totalFees += doc.data().feeAmount || 0;
+      });
+    } catch (error) {
+      console.error('Error calculating total fees:', error);
+    }
+
     // Format uptime
     const uptime = process.uptime();
     const days = Math.floor(uptime / 86400);
@@ -1074,13 +1683,14 @@ bot.command('stats', async (ctx) => {
       `Total Users: ${userCount}\n` +
       `Active Wallets: ${activeWalletCount}\n` +
       `Total Transactions: ${txCount}\n` +
+      `Total Fees Collected: ${totalFees.toFixed(4)} SOL\n` +
       `Bot Wallet Balance: ${botBalanceSOL.toFixed(4)} SOL\n` +
       `Uptime: ${uptimeString}`,
       { parse_mode: 'HTML' }
     );
   } catch (error) {
     console.error('❌ Stats Command Error:', error);
-    await ctx.reply('❌ An error occurred while fetching stats. Please check the logs.');
+    await ctx.reply('❌ An error occurred while fetching stats. Please check logs.');
   }
 });
 
@@ -1156,7 +1766,7 @@ bot.command('start', async (ctx) => {
     const balanceUSD = (balanceSOL * solPrice).toFixed(2);
 
     await ctx.reply(
-      `🚀 Welcome Back! ${greeting}\n\n👋 Active Wallet: I'm here to help you manage your Solana wallet.\n\nFaras on Solana – The fastest way to send, receive, and make local payments easily via Solana deposits. 🚀\n\nWallet SOLANA\n\nLet's get started! How would you like to trade today?\n\nWallet Address: ${activeWallet.publicKey}\n\nBalance: ${balanceSOL.toFixed(4)} SOL (~$${balanceUSD} USD)\n\nWhat would you like to do?`,
+      `🚀 Welcome Back! ${greeting}\n\nActive Wallet: I'm here to help you manage your Solana wallet.\n\nFaras on Solana – The fastest way to send, receive, and make local payments easily via Solana deposits. 🚀\n\nWallet SOLANA\n\nLet's get started! How would you like to trade today?\n\nWallet Address: ${activeWallet.publicKey}\n\nBalance: ${balanceSOL.toFixed(4)} SOL (~$${balanceUSD} USD)\n\nWhat would you like to do?`,
       {
         parse_mode: 'HTML',
         ...Markup.inlineKeyboard([
@@ -1182,6 +1792,7 @@ bot.command('start', async (ctx) => {
     await ctx.reply('❌ Oops! An error occurred. Please try again later.', { parse_mode: 'HTML' });
   }
 });
+
 bot.action('help', async (ctx) => {
   try {
     const helpMessage = `<b>Help</b>\n\n` +
@@ -1231,9 +1842,6 @@ bot.action('close_help', async (ctx) => {
   }
 });
 
-
-
-// Referral Friends
 // Referral Friends Action - Improved Version
 bot.action('referral_friends', async (ctx) => {
   try {
@@ -1280,7 +1888,6 @@ When friends use your link:
 ┗ Ongoing: You earn <b>10%</b> forever!
 
 💡 <i>Share your link below to start earning!</i>`;
-
 
     await ctx.reply(messageText, {
       parse_mode: 'HTML',
@@ -1698,7 +2305,7 @@ bot.on('text', async (ctx) => {
       }
       ctx.session.cashBuy.amount = amount;
       ctx.session.cashBuy.step = 'confirm';
-      const fee = amount * 0.05;
+      const fee = amount * currentFee;
       const netAmount = amount - fee;
       const solPrice = await getSolPrice();
       const solReceived = solPrice ? (netAmount / solPrice) : 0;
@@ -1839,7 +2446,7 @@ async function handleWithdrawal(ctx) {
 
     const signature = await connection.sendTransaction(transaction, [fromKeypair]);
 
-    await saveTransaction(
+    await saveTransactionWithFees(
       userId,
       'send',
       ctx.session.sendFlow.amountSOL,
@@ -1952,10 +2559,19 @@ bot.action('cash_buy', (ctx) => {
 });
 
 bot.action(['evcplus', 'zaad', 'sahal'], (ctx) => {
+  if (!ctx.session.cashBuy) {
+    ctx.session.cashBuy = {}; // initialize if it doesn't exist
+  }
+
   ctx.session.cashBuy.paymentMethod = ctx.match[0];
   ctx.session.cashBuy.step = 'phoneNumber';
-  ctx.reply(`You selected <b>${ctx.match[0].toUpperCase()}</b>.\n\nPlease enter your 9-digit phone number:`, { parse_mode: 'HTML' });
+
+  ctx.reply(
+    `You selected <b>${ctx.match[0].toUpperCase()}</b>.\n\nPlease enter your 9-digit phone number:`,
+    { parse_mode: 'HTML' }
+  );
 });
+
 
 bot.action('submit', async (ctx) => {
   try {
