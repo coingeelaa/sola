@@ -1808,7 +1808,7 @@ bot.action('help', async (ctx) => {
       `Your Net Profit is calculated after deducting all associated costs, including Price Impact, Transfer Tax, Dex Fees, and a 1% BONKbot fee. This ensures the figure you see is what you actually receive, accounting for all transaction-related expenses.\n\n` +
       `<b>Is there a difference between @FARASbotChat and the backup bots?</b>\n` +
       `No, they are all the same bot and you can use them interchangeably. If one is slow or down, you can use the other ones. You will have access to the same wallet and positions.\n\n` +
-      `<b>Further questions?</b> Join our Telegram group: <a href="https://t.me/FARASbotChat">FARASbotChat</a>`;
+      `<b>Further questions?</b> Join our Telegram group: <a href="https://t.me/FarasbotChats">FarasbotChats</a>`;
 
     await ctx.reply(helpMessage, {
       parse_mode: 'HTML',
@@ -1816,7 +1816,7 @@ bot.action('help', async (ctx) => {
         inline_keyboard: [
           [
             
-            { text: 'VIEW CHANNEL', url: 'https://t.me/FARASbotChat' }
+            { text: 'VIEW CHANNEL', url: 'https://t.me/FarasbotChats' }
           ],
           [
             { text: 'Close', callback_data: 'close_help' }
